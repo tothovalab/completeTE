@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 
+
 import argparse
 import pandas as pd
+import numpy as np
+import re
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 def load_ucsc_rmsk(rmsk_path):
     """
@@ -14,18 +18,26 @@ def load_ucsc_rmsk(rmsk_path):
         "subfamily", "family", "class",
         "repStart", "repEnd", "repLeft", "id"
     ]
-
-    rmsk = pd.read_csv(
+    usecols = ["chr", "start", "end", "subfamily", "class", "strand"]
+    dtype = {
+        "chr": str,
+        "start": np.int32,
+        "end": np.int32,
+        "subfamily": str,
+        "class": str,
+        "strand": str
+    }
+    te_bed = pd.read_csv(
         rmsk_path,
         sep="\t",
         header=None,
-        names=colnames
+        names=colnames,
+        usecols=usecols,
+        dtype=dtype,
+        engine="c"
     )
-
-    te_bed = rmsk[["chr", "start", "end", "subfamily", "class", "strand"]].copy()
     te_bed = te_bed[~te_bed["subfamily"].str.contains("Simple_repeat|Low_complexity|Satellite", regex=True)]
     te_bed = te_bed[te_bed["strand"].isin(["+", "-"])]
-
     return te_bed
 
 
@@ -36,38 +48,36 @@ def parse_args():
             "(LTR–INT–LTR) from UCSC RepeatMasker annotations."
         )
     )
-
-    # other params: tolerance, LTR of interest, int of interest, output folder
-    
     parser.add_argument(
         "-r", "--rmsk",
         required=True,
         help="UCSC RepeatMasker annotation file"
     )
-    
     parser.add_argument(
         "-i", "--int",
         required=True,
         help="Int subfamily name"
     )
-    
     parser.add_argument(
         "-l", "--ltr",
         required=True,
         help="LTR subfamily name"
     )
-    
     parser.add_argument(
         "-t", "--tolerance",
+        type=int,
         required=False,
         help="tolerance for complete element flanking region",
         default=10000
     )
-
-
+    parser.add_argument(
+        "-o", "--output",
+        required=True,
+        help="Output CSV file for complete elements"
+    )
     return parser.parse_args()
 
-def sort_chromosomes(df):
+def sort_chromosomes(df, start_col="start"):
     # Extract numeric or special parts of chromosome names
     def chr_key(c):
         match = re.match(r"chr(\d+)", c)
@@ -84,9 +94,39 @@ def sort_chromosomes(df):
 
     df = df.copy()
     df["chr_sort"] = df["chr"].apply(chr_key)
-    df = df.sort_values(["chr_sort", "start"]).drop(columns=["chr_sort"]).reset_index(drop=True)
+    df = df.sort_values(["chr_sort", start_col]).drop(columns=["chr_sort"]).reset_index(drop=True)
     return df
 
+
+def ltr_elements_from_dict(ltr_elements_dict):
+    return pd.DataFrame(ltr_elements_dict)
+
+def parallel_find_triplet(row_tuple, ltr_elements_dict, tolerance):
+    _, row = row_tuple
+    chrom = row["chr"]
+    strand = row["strand"]
+    int_start = row["start"]
+    int_end = row["end"]
+    ltr_elements = ltr_elements_from_dict(ltr_elements_dict)
+    ltrs_chr = ltr_elements.loc[(ltr_elements["chr"] == chrom) & (ltr_elements["strand"] == strand)]
+    ltr_up_mask = (abs(ltrs_chr["end"] - int_start) <= tolerance) & (ltrs_chr["end"] <= int_start)
+    ltr_down_mask = (abs(ltrs_chr["start"] - int_end) <= tolerance) & (ltrs_chr["start"] >= int_end)
+    ltr_up = ltrs_chr.loc[ltr_up_mask]
+    ltr_down = ltrs_chr.loc[ltr_down_mask]
+    if not ltr_up.empty and not ltr_down.empty:
+        up = ltr_up.iloc[ltr_up["end"].sub(int_start).abs().argsort().iloc[0]]
+        down = ltr_down.iloc[ltr_down["start"].sub(int_end).abs().argsort().iloc[0]]
+        return {
+            "chr": chrom,
+            "strand": strand,
+            "ltr_up_start": up["start"],
+            "ltr_up_end": up["end"],
+            "int_start": int_start,
+            "int_end": int_end,
+            "ltr_down_start": down["start"],
+            "ltr_down_end": down["end"]
+        }
+    return None
 
 def main():
     args = parse_args()
@@ -94,52 +134,37 @@ def main():
     te_bed = load_ucsc_rmsk(args.rmsk)
     int_of_interest = args.int
     ltr_of_interest = args.ltr
-    
-    #create log file for these print statements in output dir
+    tolerance = args.tolerance
+    output_file = args.output
 
     print(f"Loaded {len(te_bed):,} RepeatMasker records")
     print(te_bed.head())
-    
+
     int_elements = te_bed[te_bed['subfamily'] == int_of_interest].sort_values(["chr", "start"]).reset_index(drop=True)
     ltr_elements = te_bed[te_bed['subfamily'] == ltr_of_interest].sort_values(["chr", "start"]).reset_index(drop=True)
-    
+
     int_elements = sort_chromosomes(int_elements)
     ltr_elements = sort_chromosomes(ltr_elements)
-    
-    tolerance = args.tolerance
-
-    int_elements = int_elements.sort_values(["chr", "start"])
-    ltr_elements = ltr_elements.sort_values(["chr", "start"])
 
     triplets = []
 
-    for _, row in int_elements.iterrows():
-        chrom = row["chr"]
-        strand = row["strand"]
-        int_start = row["start"]
-        int_end = row["end"]
 
-        ltrs_chr = ltr_elements[(ltr_elements["chr"] == chrom) & (ltr_elements["strand"] == strand)]
-        ltr_up = ltrs_chr[(abs(ltrs_chr["end"] - int_start) <= tolerance) & (ltrs_chr["end"] <= int_start)]
-        ltr_down = ltrs_chr[(abs(ltrs_chr["start"] - int_end) <= tolerance) & (ltrs_chr["start"] >= int_end)]
+    # Prepare for parallel processing
+    int_rows = list(int_elements.iterrows())
+    ltr_elements_dict = ltr_elements.to_dict("list")
 
-        if not ltr_up.empty and not ltr_down.empty:
-            up = ltr_up.iloc[ltr_up["end"].sub(int_start).abs().argsort().iloc[0]]
-            down = ltr_down.iloc[ltr_down["start"].sub(int_end).abs().argsort().iloc[0]]
-
-            triplets.append({
-                "chr": chrom,
-                "strand": strand,
-                "ltr_up_start": up["start"],
-                "ltr_up_end": up["end"],
-                "int_start": int_start,
-                "int_end": int_end,
-                "ltr_down_start": down["start"],
-                "ltr_down_end": down["end"]
-            })
+    with ProcessPoolExecutor() as executor:
+        futures = [executor.submit(parallel_find_triplet, row_tuple, ltr_elements_dict, tolerance) for row_tuple in int_rows]
+        for future in as_completed(futures):
+            result = future.result()
+            if result is not None:
+                triplets.append(result)
 
     ltr_elements_full = pd.DataFrame(triplets)
-    ltr_elements_full
+
+    if ltr_elements_full.empty:
+        print("No complete elements found with the given parameters.")
+        return
 
     group_cols = [
         "chr", "strand",
@@ -157,6 +182,7 @@ def main():
         .sort_values(["chr", "ltr_up_start", "int_start"])
         .reset_index(drop=True)
     )
+
 
     ltr_elements_full_collapsed = ltr_elements_full_collapsed.assign(
         ltr_5_start=np.where(
@@ -181,7 +207,11 @@ def main():
         )
     )
 
-    ltr_elements_full_collapsed.to_csv(out_file)
+    # Sort by chromosome order using sort_chromosomes, use ltr_5_start as the start column
+    ltr_elements_full_collapsed = sort_chromosomes(ltr_elements_full_collapsed, start_col="ltr_5_start")
+
+    ltr_elements_full_collapsed.to_csv(output_file, index=False)
+    print(f"Saved {len(ltr_elements_full_collapsed)} complete elements to {output_file}")
 
 
 if __name__ == "__main__":

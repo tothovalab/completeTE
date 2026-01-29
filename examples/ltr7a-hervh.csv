@@ -1,0 +1,2 @@
+chr,strand,ltr_up_start,ltr_up_end,ltr_down_start,ltr_down_end,int_start,int_end,ltr_5_start,ltr_5_end,ltr_3_start,ltr_3_end
+chrX,+,109178344,109178794,109183709,109184158,109178794,109183709,109178344,109178794,109183709,109184158
